@@ -11,6 +11,7 @@ Structure:
   Apply:   /careers/apply/{uuid}/
 """
 
+import asyncio
 import re
 from urllib.parse import quote_plus
 
@@ -237,3 +238,7 @@ async def main() -> None:
             raise
 
         Actor.log.info(f"Done! Total unique jobs scraped: {len(seen_uuids)}")
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

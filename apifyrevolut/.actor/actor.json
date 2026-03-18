@@ -1,0 +1,40 @@
+{
+    "actorSpecification": 1,
+    "name": "revolut-careers-scraper",
+    "title": "Revolut Careers Scraper",
+    "description": "Scrapes Revolut UAE career pages for job listings. Clicks 'Show more', extracts positions, generates apply URLs.",
+    "version": "0.0",
+    "buildTag": "latest",
+    "input": "./input_schema.json",
+    "dockerfile": "../Dockerfile",
+    "storages": {
+        "dataset": {
+            "actorSpecification": 1,
+            "title": "Revolut Jobs",
+            "views": {
+                "jobs": {
+                    "title": "Jobs",
+                    "transformation": {
+                        "fields": [
+                            "title",
+                            "team",
+                            "location",
+                            "location_details",
+                            "apply_url",
+                            "detail_url",
+                            "uuid"
+                        ]
+                    },
+                    "display": {
+                        "component": "table",
+                        "properties": {
+                            "title": { "label": "Job Title", "format": "text" },
+                            "team": { "label": "Team", "format": "text" },
+                            "apply_url": { "label": "Apply URL", "format": "link" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

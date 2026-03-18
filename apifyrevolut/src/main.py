@@ -226,6 +226,14 @@ async def main() -> None:
                 f"total unique so far: {len(seen_uuids)}"
             )
 
-        await crawler.run(start_requests)
+        Actor.log.info(f"Starting crawler with {len(start_requests)} requests")
+        for r in start_requests:
+            Actor.log.info(f"  Request: {r.url}")
+
+        try:
+            await crawler.run(start_requests)
+        except Exception as e:
+            Actor.log.exception(f"Crawler failed: {e}")
+            raise
 
         Actor.log.info(f"Done! Total unique jobs scraped: {len(seen_uuids)}")

@@ -93,7 +93,7 @@ async def main() -> None:
             max_requests_per_crawl=len(start_requests) + 5,
             headless=True,
             browser_type="chromium",
-            concurrency_settings=ConcurrencySettings(max_concurrency=1),  # Sequential to avoid rate limiting
+            concurrency_settings=ConcurrencySettings(max_concurrency=1, desired_concurrency=1),  # Sequential to avoid rate limiting
         )
 
         @crawler.router.default_handler

@@ -15,7 +15,7 @@ import re
 from urllib.parse import quote_plus
 
 from apify import Actor
-from crawlee.playwright_crawler import PlaywrightCrawler, PlaywrightCrawlingContext
+from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 
 # ─── Team name → URL parameter mapping ──────────────────────
 TEAM_URL_PARAMS = {

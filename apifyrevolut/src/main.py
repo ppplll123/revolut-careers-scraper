@@ -15,6 +15,7 @@ import re
 from urllib.parse import quote_plus
 
 from apify import Actor
+from crawlee import Request
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 
 # ─── Team name → URL parameter mapping ──────────────────────
@@ -74,13 +75,13 @@ async def main() -> None:
                 team_param = quote_plus(team_name)
             url = f"{BASE_URL}?city={city}&team={team_param}"
             start_requests.append(
-                {
-                    "url": url,
-                    "userData": {
+                Request.from_url(
+                    url,
+                    user_data={
                         "team": team_name,
                         "teamIndex": teams.index(team_name),
                     },
-                }
+                )
             )
 
         # Track seen UUIDs globally for deduplication

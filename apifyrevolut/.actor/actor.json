@@ -2,7 +2,7 @@
     "actorSpecification": 1,
     "name": "revolut-careers-scraper",
     "title": "Revolut Careers Scraper",
-    "description": "Scrapes Revolut UAE career pages for job listings. Clicks 'Show more', extracts positions, generates apply URLs.",
+    "description": "Scrapes Revolut UAE career pages for job listings with full descriptions and apply form fields.",
     "version": "0.0",
     "buildTag": "latest",
     "input": "./input_schema.json",
@@ -22,15 +22,39 @@
                             "location_details",
                             "apply_url",
                             "detail_url",
-                            "uuid"
+                            "uuid",
+                            "description",
+                            "apply_form_fields",
+                            "apply_form_text"
                         ]
                     },
                     "display": {
                         "component": "table",
                         "properties": {
-                            "title": { "label": "Job Title", "format": "text" },
-                            "team": { "label": "Team", "format": "text" },
-                            "apply_url": { "label": "Apply URL", "format": "link" }
+                            "title": {
+                                "label": "Job Title",
+                                "format": "text"
+                            },
+                            "team": {
+                                "label": "Team",
+                                "format": "text"
+                            },
+                            "description": {
+                                "label": "Description",
+                                "format": "text"
+                            },
+                            "apply_url": {
+                                "label": "Apply URL",
+                                "format": "link"
+                            },
+                            "detail_url": {
+                                "label": "Detail URL",
+                                "format": "link"
+                            },
+                            "apply_form_text": {
+                                "label": "Apply Form",
+                                "format": "text"
+                            }
                         }
                     }
                 }

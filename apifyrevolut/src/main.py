@@ -17,6 +17,7 @@ from urllib.parse import quote_plus
 
 from apify import Actor
 from crawlee import Request
+from crawlee import ConcurrencySettings
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 
 # ─── Team name → URL parameter mapping ──────────────────────
@@ -92,7 +93,7 @@ async def main() -> None:
             max_requests_per_crawl=len(start_requests) + 5,
             headless=True,
             browser_type="chromium",
-            max_concurrency=1,  # Sequential to avoid rate limiting
+            concurrency_settings=ConcurrencySettings(max_concurrency=1),  # Sequential to avoid rate limiting
         )
 
         @crawler.router.default_handler

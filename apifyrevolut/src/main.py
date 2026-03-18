@@ -1,19 +1,23 @@
 """Apify Actor: Revolut UAE Careers Scraper.
 
-Scrapes Revolut career pages for UAE-Remote jobs across specified teams.
-Three-phase scraping:
-  1. Listing pages: extract job titles, URLs, teams
-  2. Detail pages: extract full job descriptions
-  3. Apply pages: extract application form fields
+Strategy:
+  Revolut uses Next.js with SSG. ALL positions (648+) are embedded in the
+  __NEXT_DATA__ JSON on the careers listing page. No "Show more" clicking needed.
+
+  Phase 1: Fetch listing page, parse __NEXT_DATA__ for all positions
+  Phase 2: Fetch detail pages for job descriptions (also from __NEXT_DATA__)
+  Phase 3: Scrape apply form fields from /careers/apply/{uuid}/
 
 Structure:
-  Listing: /careers/?city=UAE+-+Remote&team=Executive
-  Detail:  /careers/position/{slug}-{uuid}/
+  Listing: /careers/  (contains ALL positions in __NEXT_DATA__)
+  Detail:  /careers/position/{slug}-{uuid}/  (has description in __NEXT_DATA__)
   Apply:   /careers/apply/{uuid}/
 """
 
 import asyncio
+import json
 import re
+from html import unescape
 from urllib.parse import quote_plus
 
 from apify import Actor
@@ -31,9 +35,21 @@ TEAM_URL_PARAMS = {
     "Operations": "Operations",
     "Business Development": "Business+Development",
     "Support & FinCrime": "Support+%26+FinCrime",
+    "Engineering": "Engineering",
+    "Data": "Data",
+    "People & Recruitment": "People+%26+Recruitment",
+    "Sales": "Sales",
+    "Other": "Other",
 }
 
 BASE_URL = "https://www.revolut.com/careers/"
+
+UAE_LOCATION_PATTERNS = [
+    r"\bUAE\b",
+    r"\bDubai\b",
+    r"\bAbu Dhabi\b",
+    r"\bUnited Arab Emirates\b",
+]
 
 # Stop markers for truncating boilerplate
 DETAIL_STOP_MARKERS = [
@@ -52,6 +68,24 @@ APPLY_STOP_MARKERS = [
     "Data Privacy Notice for Candidates",
 ]
 
+TEAM_PREFERENCE_ORDER = [
+    "Executive",
+    "Risk, Compliance & Audit",
+    "Product & Design",
+    "Credit",
+    "Finance",
+    "Legal",
+    "Marketing & Comms",
+    "Operations",
+    "Business Development",
+    "Support & FinCrime",
+    "Engineering",
+    "Data",
+    "People & Recruitment",
+    "Sales",
+    "Other",
+]
+
 
 def extract_uuid(url: str) -> str:
     m = re.search(
@@ -64,8 +98,51 @@ def should_skip(title: str, patterns: list[str]) -> bool:
     return any(re.search(p, title, re.IGNORECASE) for p in patterns)
 
 
+def has_uae_location(locations: list[dict]) -> bool:
+    for loc in locations:
+        name = loc.get("name", "")
+        country = loc.get("country", "")
+        combined = f"{name} {country}"
+        if any(re.search(p, combined, re.IGNORECASE) for p in UAE_LOCATION_PATTERNS):
+            return True
+    return False
+
+
+def format_locations(locations: list[dict]) -> str:
+    offices = []
+    remotes = []
+    for loc in locations:
+        name = loc.get("name", "")
+        loc_type = loc.get("type", "")
+        if loc_type == "office":
+            offices.append(name)
+        elif loc_type == "remote":
+            remotes.append(name)
+    parts = []
+    if offices:
+        parts.append(f"Office: {', '.join(offices)}")
+    if remotes:
+        parts.append(f"Remote: {', '.join(remotes)}")
+    return " | ".join(parts)
+
+
+def html_to_text(html_str: str) -> str:
+    """Convert HTML job description to clean text."""
+    if not html_str:
+        return ""
+    text = unescape(html_str)
+    text = re.sub(r"<h[1-6][^>]*>", "\n\n## ", text)
+    text = re.sub(r"</h[1-6]>", "\n", text)
+    text = re.sub(r"<li[^>]*>", "\n- ", text)
+    text = re.sub(r"<br\s*/?>", "\n", text)
+    text = re.sub(r"<p[^>]*>", "\n", text)
+    text = re.sub(r"</p>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def truncate_at_markers(text: str, markers: list[str]) -> str:
-    """Truncate text at the first occurrence of any marker."""
     earliest = len(text)
     for marker in markers:
         idx = text.find(marker)
@@ -90,29 +167,19 @@ async def main() -> None:
                 r"\b(apprentice)\b",
             ],
         )
-        max_show_more = actor_input.get("maxShowMoreClicks", 20)
         scrape_details = actor_input.get("scrapeDetails", True)
         scrape_apply_form = actor_input.get("scrapeApplyForm", True)
 
-        start_requests = []
-        for team_name in teams:
-            team_param = TEAM_URL_PARAMS.get(team_name)
-            if not team_param:
-                team_param = quote_plus(team_name)
-            url = f"{BASE_URL}?city={city}&team={team_param}"
-            start_requests.append(
-                Request.from_url(
-                    url,
-                    user_data={"team": team_name, "teamIndex": teams.index(team_name)},
-                )
-            )
+        # ─── Phase 1: Extract ALL positions from __NEXT_DATA__ ──────
 
-        # Shared storage for multi-phase scraping
         collected_jobs: dict[str, dict] = {}
         seen_uuids: set[str] = set()
+        team_counts: dict[str, int] = {}
 
-        crawler = PlaywrightCrawler(
-            max_requests_per_crawl=500,
+        # We use PlaywrightCrawler for the listing page too, to handle
+        # any potential JS-rendered content, but extract from __NEXT_DATA__
+        listing_crawler = PlaywrightCrawler(
+            max_requests_per_crawl=5,
             headless=True,
             browser_type="chromium",
             concurrency_settings=ConcurrencySettings(
@@ -120,296 +187,321 @@ async def main() -> None:
             ),
         )
 
-        @crawler.router.default_handler
-        async def handle_team_page(context: PlaywrightCrawlingContext) -> None:
-            """Phase 1: Extract job listings from team pages."""
+        @listing_crawler.router.default_handler
+        async def handle_listing(context: PlaywrightCrawlingContext) -> None:
             page = context.page
-            team_name = context.request.user_data.get("team", "Unknown")
-            team_index = context.request.user_data.get("teamIndex", 99)
-
-            Actor.log.info(f"Scraping team: {team_name}")
+            Actor.log.info("Extracting positions from __NEXT_DATA__")
             await page.wait_for_timeout(3000)
 
-            # Click "Show more" until all jobs visible
-            show_more_clicks = 0
-            while show_more_clicks < max_show_more:
-                try:
-                    show_more = page.locator("text=Show more").first
-                    if await show_more.is_visible(timeout=2000):
-                        await show_more.click()
-                        show_more_clicks += 1
-                        await page.wait_for_timeout(1500)
-                    else:
-                        break
-                except Exception:
-                    break
-
-            if show_more_clicks:
-                Actor.log.info(f"  [{team_name}] Clicked Show more {show_more_clicks}x")
-
-            job_links = await page.evaluate(
-                """
-                () => {
-                    const jobs = [];
-                    document.querySelectorAll('a[href*="/careers/position/"]').forEach(a => {
-                        const title = a.textContent.trim().split('\n')[0].trim();
-                        const href = a.getAttribute('href');
-                        if (title && href && title.length > 3 && title.length < 200) {
-                            const parent = a.closest(
-                                '[class*="card"], [class*="Card"], [class*="item"], ' +
-                                '[class*="Item"], [class*="role"], [class*="Role"]'
-                            ) || a.parentElement;
-                            let location = '';
-                            if (parent) {
-                                const locEls = parent.querySelectorAll('span, p, div');
-                                for (const el of locEls) {
-                                    const text = el.textContent.trim();
-                                    if (text.includes('Remote:') || text.includes('Office:')) {
-                                        location += text + ' ';
-                                    }
-                                }
-                            }
-                            jobs.push({ title, href, location: location.trim() });
-                        }
-                    });
-                    return jobs;
-                }
-            """
+            # Extract __NEXT_DATA__ JSON
+            next_data = await page.evaluate(
+                "() => {"
+                "  var el = document.getElementById('__NEXT_DATA__');"
+                "  if (el) return JSON.parse(el.textContent);"
+                "  return null;"
+                "}"
             )
 
-            Actor.log.info(f"  [{team_name}] Found {len(job_links)} raw links")
+            if not next_data:
+                Actor.log.warning("__NEXT_DATA__ not found!")
+                return
 
-            team_seen_titles: set[str] = set()
-            jobs_added = 0
-            enqueue_requests = []
+            positions = (
+                next_data.get("props", {}).get("pageProps", {}).get("positions", [])
+            )
+            Actor.log.info(f"Found {len(positions)} total positions in __NEXT_DATA__")
 
-            for link in job_links:
-                title = link.get("title", "").strip()
-                href = link.get("href", "")
-                location_details = link.get("location", "")
+            # Get team counts from widget data
+            widget = (
+                next_data.get("props", {})
+                .get("pageProps", {})
+                .get("widgetData", {})
+                .get("careers-teams-widget", {})
+            )
+            total_count = widget.get("total", len(positions))
+            functions_raw = widget.get("functions", {})
+            for func_name, count in functions_raw.items():
+                team_counts[func_name] = count
+            team_counts["_total"] = total_count
 
-                if not title or not href or title in team_seen_titles:
+            Actor.log.info(f"Total open positions (widget): {total_count}")
+
+            # Filter positions
+            skipped_no_uae = 0
+            skipped_junior = 0
+            skipped_team = 0
+
+            teams_set = set(teams)
+
+            for pos in positions:
+                title = pos.get("text", "").strip()
+                pos_id = pos.get("id", "")
+                team = pos.get("team", "Unknown")
+                locations = pos.get("locations", [])
+
+                if not title or not pos_id:
                     continue
-                team_seen_titles.add(title)
+
+                if team not in teams_set:
+                    skipped_team += 1
+                    continue
+
+                if not has_uae_location(locations):
+                    skipped_no_uae += 1
+                    continue
 
                 if should_skip(title, skip_patterns):
+                    skipped_junior += 1
                     continue
 
-                detail_url = (
-                    href if href.startswith("http") else f"https://www.revolut.com{href}"
+                if pos_id in seen_uuids:
+                    continue
+                seen_uuids.add(pos_id)
+
+                team_index = (
+                    TEAM_PREFERENCE_ORDER.index(team)
+                    if team in TEAM_PREFERENCE_ORDER
+                    else 99
                 )
-                uuid = extract_uuid(detail_url)
-                if not uuid or uuid in seen_uuids:
-                    continue
-                seen_uuids.add(uuid)
+                apply_url = f"https://www.revolut.com/careers/apply/{pos_id}/"
+                detail_url = f"https://www.revolut.com/careers/position/{pos_id}/"
 
-                apply_url = f"https://www.revolut.com/careers/apply/{uuid}/"
-
-                collected_jobs[uuid] = {
+                collected_jobs[pos_id] = {
                     "title": title,
                     "company": "Revolut",
-                    "team": team_name,
+                    "team": team,
                     "teamPreferenceIndex": team_index,
                     "location": city.replace("+", " ").replace("-", "- "),
-                    "location_details": location_details,
+                    "location_details": format_locations(locations),
                     "apply_url": apply_url,
                     "detail_url": detail_url,
-                    "uuid": uuid,
+                    "uuid": pos_id,
                     "platform": "revolut_custom",
                     "score": round(max(0.5, 0.9 - team_index * 0.04), 2),
                     "description": None,
+                    "description_html": None,
                     "apply_form_fields": None,
                     "apply_form_text": None,
                 }
 
-                if scrape_details:
-                    enqueue_requests.append(
-                        Request.from_url(
-                            detail_url,
-                            label="detail",
-                            user_data={"uuid": uuid},
-                        )
-                    )
-                if scrape_apply_form:
-                    enqueue_requests.append(
-                        Request.from_url(
-                            apply_url,
-                            label="apply",
-                            user_data={"uuid": uuid},
-                        )
-                    )
-                jobs_added += 1
-
-            if enqueue_requests:
-                await context.add_requests(enqueue_requests)
-
             Actor.log.info(
-                f"  [{team_name}] Added {jobs_added} jobs, total unique: {len(seen_uuids)}"
+                f"Filtered: {len(collected_jobs)} UAE jobs "
+                f"(skipped {skipped_no_uae} non-UAE, "
+                f"{skipped_junior} junior/student, "
+                f"{skipped_team} wrong team)"
             )
 
-        @crawler.router.handler("detail")
-        async def handle_detail(context: PlaywrightCrawlingContext) -> None:
-            """Phase 2: Extract job description from detail pages."""
-            page = context.page
-            uuid = context.request.user_data.get("uuid", "")
-            job_title = collected_jobs.get(uuid, {}).get("title", "unknown")
+        listing_request = Request.from_url(BASE_URL)
+        Actor.log.info(f"Phase 1: Fetching listing page {BASE_URL}")
+        await listing_crawler.run([listing_request])
 
-            Actor.log.info(f"  [Detail] {job_title}")
-            await page.wait_for_timeout(3000)
+        if not collected_jobs:
+            Actor.log.warning("No jobs found! Exiting.")
+            return
 
-            try:
-                raw_text = await page.evaluate("() => document.body.innerText")
+        # ─── Phase 2 & 3: Detail pages + Apply form scraping ────────
 
-                # Try to start from meaningful section headers
-                start_markers = [
-                    "About the role",
-                    "About the job",
-                    "What you\u2019ll be doing",
-                    "What you'll be doing",
-                    "Description",
-                    "The Role",
-                ]
-                start_idx = 0
-                for marker in start_markers:
-                    idx = raw_text.find(marker)
-                    if idx != -1:
-                        start_idx = idx
-                        break
-
-                description = raw_text[start_idx:]
-                description = truncate_at_markers(description, DETAIL_STOP_MARKERS)
-
-                if uuid in collected_jobs:
-                    collected_jobs[uuid]["description"] = description.strip()
-
-                Actor.log.info(f"  [Detail] {uuid}: {len(description)} chars")
-            except Exception as e:
-                Actor.log.warning(f"  [Detail] Failed {uuid}: {e}")
-
-        @crawler.router.handler("apply")
-        async def handle_apply(context: PlaywrightCrawlingContext) -> None:
-            """Phase 3: Extract application form fields from apply pages."""
-            page = context.page
-            uuid = context.request.user_data.get("uuid", "")
-            job_title = collected_jobs.get(uuid, {}).get("title", "unknown")
-
-            Actor.log.info(f"  [Apply] {job_title}")
-            await page.wait_for_timeout(5000)
-
-            try:
-                form_data = await page.evaluate(
-                    """
-                    () => {
-                        const fields = [];
-
-                        // Method 1: Standard label elements
-                        document.querySelectorAll('label').forEach(label => {
-                            const text = label.textContent.trim().replace(/\s+/g, ' ');
-                            const forAttr = label.getAttribute('for');
-                            let input = forAttr ? document.getElementById(forAttr) : null;
-                            if (!input) input = label.querySelector('input, select, textarea');
-
-                            let fieldType = 'unknown';
-                            let options = [];
-                            let required = false;
-
-                            if (input) {
-                                fieldType = input.tagName.toLowerCase();
-                                if (fieldType === 'input') fieldType = input.type || 'text';
-                                if (fieldType === 'select') {
-                                    input.querySelectorAll('option').forEach(opt => {
-                                        if (opt.value) options.push(opt.textContent.trim());
-                                    });
-                                }
-                                required = input.required ||
-                                           input.getAttribute('aria-required') === 'true';
-                            }
-
-                            if (text && text.length > 1 && text.length < 300) {
-                                const field = { label: text, type: fieldType, required };
-                                if (options.length) field.options = options;
-                                fields.push(field);
-                            }
-                        });
-
-                        // Method 2: aria-label inputs not covered above
-                        document.querySelectorAll(
-                            'input[aria-label], select[aria-label], textarea[aria-label]'
-                        ).forEach(input => {
-                            const al = input.getAttribute('aria-label');
-                            if (al && !fields.some(f => f.label.includes(al))) {
-                                let ft = input.tagName.toLowerCase();
-                                if (ft === 'input') ft = input.type || 'text';
-                                fields.push({
-                                    label: al,
-                                    type: ft,
-                                    required: input.required ||
-                                              input.getAttribute('aria-required') === 'true',
-                                });
-                            }
-                        });
-
-                        // Method 3: placeholder-only inputs
-                        document.querySelectorAll(
-                            'input[placeholder], textarea[placeholder]'
-                        ).forEach(input => {
-                            const ph = input.getAttribute('placeholder');
-                            if (ph && !fields.some(f =>
-                                f.label.includes(ph) || f.label === ph
-                            )) {
-                                let ft = input.tagName.toLowerCase();
-                                if (ft === 'input') ft = input.type || 'text';
-                                fields.push({
-                                    label: ph,
-                                    type: ft,
-                                    required: input.required ||
-                                              input.getAttribute('aria-required') === 'true',
-                                });
-                            }
-                        });
-
-                        return { fields, pageText: document.body.innerText };
-                    }
-                """
-                )
-
-                page_text = form_data.get("pageText", "")
-
-                # Extract section between "You are applying" and consent boilerplate
-                start_idx = page_text.find("You are applying")
-                if start_idx == -1:
-                    start_idx = 0
-                relevant_text = page_text[start_idx:]
-                relevant_text = truncate_at_markers(relevant_text, APPLY_STOP_MARKERS)
-
-                if uuid in collected_jobs:
-                    collected_jobs[uuid]["apply_form_fields"] = form_data.get(
-                        "fields", []
+        detail_apply_requests = []
+        for uuid, job in collected_jobs.items():
+            if scrape_details:
+                detail_apply_requests.append(
+                    Request.from_url(
+                        job["detail_url"],
+                        label="detail",
+                        user_data={"uuid": uuid},
                     )
-                    collected_jobs[uuid]["apply_form_text"] = relevant_text.strip()
-
-                fields_count = len(form_data.get("fields", []))
-                Actor.log.info(
-                    f"  [Apply] {uuid}: {fields_count} fields, {len(relevant_text)} chars"
                 )
-            except Exception as e:
-                Actor.log.warning(f"  [Apply] Failed {uuid}: {e}")
+            if scrape_apply_form:
+                detail_apply_requests.append(
+                    Request.from_url(
+                        job["apply_url"],
+                        label="apply",
+                        user_data={"uuid": uuid},
+                    )
+                )
 
-        Actor.log.info(f"Starting with {len(start_requests)} listing requests")
-        for r in start_requests:
-            Actor.log.info(f"  {r.url}")
+        if detail_apply_requests:
+            detail_crawler = PlaywrightCrawler(
+                max_requests_per_crawl=len(detail_apply_requests) + 10,
+                headless=True,
+                browser_type="chromium",
+                concurrency_settings=ConcurrencySettings(
+                    max_concurrency=3, desired_concurrency=3
+                ),
+            )
 
-        try:
-            await crawler.run(start_requests)
-        except Exception as e:
-            Actor.log.exception(f"Crawler failed: {e}")
-            raise
+            @detail_crawler.router.handler("detail")
+            async def handle_detail(context: PlaywrightCrawlingContext) -> None:
+                """Phase 2: Extract job description from __NEXT_DATA__."""
+                page = context.page
+                uuid = context.request.user_data.get("uuid", "")
+                job_title = collected_jobs.get(uuid, {}).get("title", "unknown")
 
-        # Push all collected data to Apify dataset
-        for job in collected_jobs.values():
+                Actor.log.info(f"  [Detail] {job_title}")
+                await page.wait_for_timeout(2000)
+
+                try:
+                    # Extract description from __NEXT_DATA__
+                    next_data = await page.evaluate(
+                        "() => {"
+                        "  var el = document.getElementById('__NEXT_DATA__');"
+                        "  if (el) return JSON.parse(el.textContent);"
+                        "  return null;"
+                        "}"
+                    )
+
+                    if next_data:
+                        pos_data = (
+                            next_data.get("props", {})
+                            .get("pageProps", {})
+                            .get("position", {})
+                        )
+                        desc_html = pos_data.get("description", "")
+                        if desc_html and uuid in collected_jobs:
+                            desc_text = html_to_text(desc_html)
+                            desc_text = truncate_at_markers(
+                                desc_text, DETAIL_STOP_MARKERS
+                            )
+                            collected_jobs[uuid]["description"] = desc_text
+                            collected_jobs[uuid]["description_html"] = desc_html
+                            Actor.log.info(
+                                f"  [Detail] {uuid}: {len(desc_text)} chars from __NEXT_DATA__"
+                            )
+                            return
+
+                    # Fallback: extract from visible text
+                    raw_text = await page.evaluate(
+                        "() => { return document.body.innerText; }"
+                    )
+                    start_markers = [
+                        "About the role",
+                        "About the job",
+                        "What you\u2019ll be doing",
+                        "Description",
+                    ]
+                    start_idx = 0
+                    for marker in start_markers:
+                        idx = raw_text.find(marker)
+                        if idx != -1:
+                            start_idx = idx
+                            break
+
+                    description = raw_text[start_idx:]
+                    description = truncate_at_markers(description, DETAIL_STOP_MARKERS)
+
+                    if uuid in collected_jobs:
+                        collected_jobs[uuid]["description"] = description.strip()
+
+                    Actor.log.info(
+                        f"  [Detail] {uuid}: {len(description)} chars from DOM"
+                    )
+                except Exception as e:
+                    Actor.log.warning(f"  [Detail] Failed {uuid}: {e}")
+
+            @detail_crawler.router.handler("apply")
+            async def handle_apply(context: PlaywrightCrawlingContext) -> None:
+                """Phase 3: Extract application form fields."""
+                page = context.page
+                uuid = context.request.user_data.get("uuid", "")
+                job_title = collected_jobs.get(uuid, {}).get("title", "unknown")
+
+                Actor.log.info(f"  [Apply] {job_title}")
+                await page.wait_for_timeout(5000)
+
+                try:
+                    # Use string concat to avoid \n escaping issues in evaluate
+                    form_data = await page.evaluate(
+                        "() => {"
+                        "  var fields = [];"
+                        "  document.querySelectorAll('label').forEach(function(label) {"
+                        "    var text = label.textContent.trim().replace(/\\s+/g, ' ');"
+                        "    var forAttr = label.getAttribute('for');"
+                        "    var input = forAttr ? document.getElementById(forAttr) : null;"
+                        "    if (!input) input = label.querySelector('input, select, textarea');"
+                        "    var fieldType = 'unknown';"
+                        "    var options = [];"
+                        "    var required = false;"
+                        "    if (input) {"
+                        "      fieldType = input.tagName.toLowerCase();"
+                        "      if (fieldType === 'input') fieldType = input.type || 'text';"
+                        "      if (fieldType === 'select') {"
+                        "        input.querySelectorAll('option').forEach(function(opt) {"
+                        "          if (opt.value) options.push(opt.textContent.trim());"
+                        "        });"
+                        "      }"
+                        "      required = input.required || input.getAttribute('aria-required') === 'true';"
+                        "    }"
+                        "    if (text && text.length > 1 && text.length < 300) {"
+                        "      var field = { label: text, type: fieldType, required: required };"
+                        "      if (options.length) field.options = options;"
+                        "      fields.push(field);"
+                        "    }"
+                        "  });"
+                        "  document.querySelectorAll('input[aria-label], select[aria-label], textarea[aria-label]').forEach(function(input) {"
+                        "    var al = input.getAttribute('aria-label');"
+                        "    if (al && !fields.some(function(f) { return f.label.indexOf(al) !== -1; })) {"
+                        "      var ft = input.tagName.toLowerCase();"
+                        "      if (ft === 'input') ft = input.type || 'text';"
+                        "      fields.push({ label: al, type: ft, required: input.required || input.getAttribute('aria-required') === 'true' });"
+                        "    }"
+                        "  });"
+                        "  return { fields: fields, pageText: document.body.innerText };"
+                        "}"
+                    )
+
+                    page_text = form_data.get("pageText", "")
+                    start_idx = page_text.find("You are applying")
+                    if start_idx == -1:
+                        start_idx = 0
+                    relevant_text = page_text[start_idx:]
+                    relevant_text = truncate_at_markers(
+                        relevant_text, APPLY_STOP_MARKERS
+                    )
+
+                    if uuid in collected_jobs:
+                        collected_jobs[uuid]["apply_form_fields"] = form_data.get(
+                            "fields", []
+                        )
+                        collected_jobs[uuid]["apply_form_text"] = relevant_text.strip()
+
+                    fields_count = len(form_data.get("fields", []))
+                    Actor.log.info(
+                        f"  [Apply] {uuid}: {fields_count} fields, {len(relevant_text)} chars"
+                    )
+                except Exception as e:
+                    Actor.log.warning(f"  [Apply] Failed {uuid}: {e}")
+
+            Actor.log.info(
+                f"Phase 2+3: {len(detail_apply_requests)} requests "
+                f"({len(collected_jobs)} detail + apply pages)"
+            )
+            await detail_crawler.run(detail_apply_requests)
+
+        # ─── Push results ────────────────────────────────────────────
+
+        # Sort by team preference
+        sorted_jobs = sorted(
+            collected_jobs.values(),
+            key=lambda j: j.get("teamPreferenceIndex", 99),
+        )
+
+        for job in sorted_jobs:
             await Actor.push_data(job)
 
-        Actor.log.info(f"Done! Total unique jobs: {len(collected_jobs)}")
+        # Log summary
+        teams_found = {}
+        for job in sorted_jobs:
+            t = job["team"]
+            teams_found[t] = teams_found.get(t, 0) + 1
+
+        Actor.log.info(f"Done! Total unique UAE jobs: {len(sorted_jobs)}")
+        Actor.log.info(f"Total open positions at Revolut: {team_counts.get('_total', '?')}")
+        for team, count in teams_found.items():
+            total = team_counts.get(team, "?")
+            Actor.log.info(f"  {team}: {count} UAE jobs (of {total} total)")
+
+        desc_count = sum(1 for j in sorted_jobs if j.get("description"))
+        Actor.log.info(f"Job descriptions fetched: {desc_count}/{len(sorted_jobs)}")
 
 
 if __name__ == "__main__":

@@ -48,6 +48,18 @@
             "default": 20,
             "minimum": 1,
             "maximum": 50
+        },
+        "scrapeDetails": {
+            "title": "Scrape Job Descriptions",
+            "type": "boolean",
+            "description": "Visit each detail_url to extract full job description (requirements, responsibilities, etc.)",
+            "default": true
+        },
+        "scrapeApplyForm": {
+            "title": "Scrape Apply Form Fields",
+            "type": "boolean",
+            "description": "Visit each apply_url to extract application form fields and questions",
+            "default": true
         }
     },
     "required": []

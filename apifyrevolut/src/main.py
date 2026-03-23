@@ -1,4 +1,4 @@
-"""Apify Actor: Revolut UAE Careers Scraper.
+"""Apify Actor: Revolut Multi-Region Careers Scraper.
 
 Strategy:
   Revolut uses Next.js with SSG. ALL positions (648+) are embedded in the
@@ -7,6 +7,8 @@ Strategy:
   Phase 1: Fetch listing page, parse __NEXT_DATA__ for all positions
   Phase 2: Fetch detail pages for job descriptions (also from __NEXT_DATA__)
   Phase 3: Scrape apply form fields from /careers/apply/{uuid}/
+
+Regions scraped: UAE, Poland, Europe (UK/Ireland/Spain/Portugal/etc.)
 
 Structure:
   Listing: /careers/  (contains ALL positions in __NEXT_DATA__)
@@ -49,6 +51,93 @@ UAE_LOCATION_PATTERNS = [
     r"\bDubai\b",
     r"\bAbu Dhabi\b",
     r"\bUnited Arab Emirates\b",
+]
+
+POLAND_LOCATION_PATTERNS = [
+    r"\bPoland\b",
+    r"\bWarsaw\b",
+    r"\bWarszawa\b",
+    r"\bKrak[oó]w\b",
+    r"\bCracow\b",
+    r"\bWroc[lł]aw\b",
+    r"\bGda[nń]sk\b",
+    r"\bPozna[nń]\b",
+    r"\bSilesia\b",
+    r"\b[LŁ][oó]d[zź]\b",
+    r"\bKatowice\b",
+    r"\bLublin\b",
+]
+
+EUROPE_LOCATION_PATTERNS = [
+    r"\bUK\b",
+    r"\bUnited Kingdom\b",
+    r"\bLondon\b",
+    r"\bManchester\b",
+    r"\bEdinburgh\b",
+    r"\bBirmingham\b",
+    r"\bIreland\b",
+    r"\bDublin\b",
+    r"\bSpain\b",
+    r"\bMadrid\b",
+    r"\bBarcelona\b",
+    r"\bPortugal\b",
+    r"\bLisbon\b",
+    r"\bLisboa\b",
+    r"\bPorto\b",
+    r"\bGermany\b",
+    r"\bBerlin\b",
+    r"\bFrankfurt\b",
+    r"\bMunich\b",
+    r"\bFrance\b",
+    r"\bParis\b",
+    r"\bItaly\b",
+    r"\bMilan\b",
+    r"\bRome\b",
+    r"\bNetherlands\b",
+    r"\bAmsterdam\b",
+    r"\bBelgium\b",
+    r"\bBrussels\b",
+    r"\bSwitzerland\b",
+    r"\bZurich\b",
+    r"\bAustria\b",
+    r"\bVienna\b",
+    r"\bSweden\b",
+    r"\bStockholm\b",
+    r"\bDenmark\b",
+    r"\bCopenhagen\b",
+    r"\bNorway\b",
+    r"\bOslo\b",
+    r"\bFinland\b",
+    r"\bHelsinki\b",
+    r"\bCzech\b",
+    r"\bPrague\b",
+    r"\bRomania\b",
+    r"\bBucharest\b",
+    r"\bHungary\b",
+    r"\bBudapest\b",
+    r"\bGreece\b",
+    r"\bAthens\b",
+    r"\bCroatia\b",
+    r"\bZagreb\b",
+    r"\bLithuania\b",
+    r"\bVilnius\b",
+    r"\bLatvia\b",
+    r"\bRiga\b",
+    r"\bEstonia\b",
+    r"\bTallinn\b",
+    r"\bBulgaria\b",
+    r"\bSofia\b",
+    r"\bSlovakia\b",
+    r"\bBratislava\b",
+    r"\bSlovenia\b",
+    r"\bLjubljana\b",
+    r"\bLuxembourg\b",
+    r"\bCyprus\b",
+    r"\bMalta\b",
+    r"\bEurope\b",
+    r"\bEMEA\b",
+    r"\bEEA\b",
+    r"\bEU\b",
 ]
 
 # Stop markers for truncating boilerplate
@@ -98,14 +187,30 @@ def should_skip(title: str, patterns: list[str]) -> bool:
     return any(re.search(p, title, re.IGNORECASE) for p in patterns)
 
 
-def has_uae_location(locations: list[dict]) -> bool:
+def _match_patterns(combined: str, patterns: list[str]) -> bool:
+    return any(re.search(p, combined, re.IGNORECASE) for p in patterns)
+
+
+def get_job_region(locations: list[dict]) -> str | None:
+    """Return the region for a job based on its locations.
+
+    Priority: UAE > POLAND > EUROPE (checked in order, first match wins).
+    Returns None if no region matches.
+    """
+    combined_parts = []
     for loc in locations:
         name = loc.get("name", "")
         country = loc.get("country", "")
-        combined = f"{name} {country}"
-        if any(re.search(p, combined, re.IGNORECASE) for p in UAE_LOCATION_PATTERNS):
-            return True
-    return False
+        combined_parts.append(f"{name} {country}")
+    combined = " | ".join(combined_parts)
+
+    if _match_patterns(combined, UAE_LOCATION_PATTERNS):
+        return "UAE"
+    if _match_patterns(combined, POLAND_LOCATION_PATTERNS):
+        return "POLAND"
+    if _match_patterns(combined, EUROPE_LOCATION_PATTERNS):
+        return "EUROPE"
+    return None
 
 
 def format_locations(locations: list[dict]) -> str:
@@ -227,9 +332,10 @@ async def main() -> None:
             Actor.log.info(f"Total open positions (widget): {total_count}")
 
             # Filter positions
-            skipped_no_uae = 0
+            skipped_no_region = 0
             skipped_junior = 0
             skipped_team = 0
+            region_counts: dict[str, int] = {}
 
             teams_set = set(teams)
 
@@ -246,8 +352,9 @@ async def main() -> None:
                     skipped_team += 1
                     continue
 
-                if not has_uae_location(locations):
-                    skipped_no_uae += 1
+                region = get_job_region(locations)
+                if region is None:
+                    skipped_no_region += 1
                     continue
 
                 if should_skip(title, skip_patterns):
@@ -257,6 +364,8 @@ async def main() -> None:
                 if pos_id in seen_uuids:
                     continue
                 seen_uuids.add(pos_id)
+
+                region_counts[region] = region_counts.get(region, 0) + 1
 
                 team_index = (
                     TEAM_PREFERENCE_ORDER.index(team)
@@ -271,7 +380,8 @@ async def main() -> None:
                     "company": "Revolut",
                     "team": team,
                     "teamPreferenceIndex": team_index,
-                    "location": city.replace("+", " ").replace("-", "- "),
+                    "region": region,
+                    "location": format_locations(locations),
                     "location_details": format_locations(locations),
                     "apply_url": apply_url,
                     "detail_url": detail_url,
@@ -284,9 +394,12 @@ async def main() -> None:
                     "apply_form_text": None,
                 }
 
+            region_summary = ", ".join(
+                f"{r}: {c}" for r, c in sorted(region_counts.items())
+            )
             Actor.log.info(
-                f"Filtered: {len(collected_jobs)} UAE jobs "
-                f"(skipped {skipped_no_uae} non-UAE, "
+                f"Filtered: {len(collected_jobs)} jobs across regions ({region_summary}) "
+                f"(skipped {skipped_no_region} outside target regions, "
                 f"{skipped_junior} junior/student, "
                 f"{skipped_team} wrong team)"
             )
@@ -490,15 +603,22 @@ async def main() -> None:
 
         # Log summary
         teams_found = {}
+        regions_found = {}
         for job in sorted_jobs:
             t = job["team"]
+            r = job.get("region", "UNKNOWN")
             teams_found[t] = teams_found.get(t, 0) + 1
+            regions_found[r] = regions_found.get(r, 0) + 1
 
-        Actor.log.info(f"Done! Total unique UAE jobs: {len(sorted_jobs)}")
+        Actor.log.info(f"Done! Total unique jobs across all regions: {len(sorted_jobs)}")
         Actor.log.info(f"Total open positions at Revolut: {team_counts.get('_total', '?')}")
+        Actor.log.info("Jobs by region:")
+        for region, count in sorted(regions_found.items()):
+            Actor.log.info(f"  {region}: {count} jobs")
+        Actor.log.info("Jobs by team:")
         for team, count in teams_found.items():
             total = team_counts.get(team, "?")
-            Actor.log.info(f"  {team}: {count} UAE jobs (of {total} total)")
+            Actor.log.info(f"  {team}: {count} jobs (of {total} total)")
 
         desc_count = sum(1 for j in sorted_jobs if j.get("description"))
         Actor.log.info(f"Job descriptions fetched: {desc_count}/{len(sorted_jobs)}")

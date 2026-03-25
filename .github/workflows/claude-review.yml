@@ -1,4 +1,4 @@
-name: AI Code Review (OpenAI)
+name: AI Code Review (Codex 5.3)
 
 on:
   push:
@@ -16,78 +16,82 @@ jobs:
           fetch-depth: 0
 
       - name: Get diff
-        id: diff
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            DIFF=$(git diff ${{ github.event.pull_request.base.sha }}..HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' | head -c 50000)
+            git diff ${{ github.event.pull_request.base.sha }}..HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' | head -c 50000 > /tmp/diff.txt
           else
-            DIFF=$(git diff HEAD~1..HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' 2>/dev/null | head -c 50000 || echo "Initial commit")
+            git diff HEAD~1..HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' 2>/dev/null | head -c 50000 > /tmp/diff.txt || echo "Initial commit" > /tmp/diff.txt
           fi
-          # Escape for JSON
-          DIFF_ESCAPED=$(echo "$DIFF" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
-          echo "diff=$DIFF_ESCAPED" >> $GITHUB_OUTPUT
 
       - name: AI Review
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
-            -d @- <<PAYLOAD
-          {
-            "model": "gpt-5.3-codex",
-            "temperature": 0.1,
-            "messages": [
-              {
-                "role": "system",
-                "content": "You are a senior code reviewer. Review the git diff below. Report ONLY real issues — not style preferences. Categories: CRITICAL (blocks merge), WARNING (should fix), INFO (consider). Be concise. If no issues found, say 'No issues found.'"
-              },
-              {
-                "role": "user",
-                "content": "Review this diff for:\n1. Silent failures — undefined returns, swallowed errors, empty catch blocks\n2. Cross-file consistency — exports match imports, shared constants in sync\n3. Hardcoded secrets — API keys, tokens, passwords\n4. Missing error handling — async without try-catch, unhandled promises\n5. Logic errors — off-by-one, wrong comparisons, unreachable code\n6. Security — injection risks, unsanitized input\n\nDiff:\n${{ steps.diff.outputs.diff }}"
-              }
-            ]
-          }
-          PAYLOAD
+          python3 - <<'PYEOF'
+          import json, urllib.request, os
+
+          with open("/tmp/diff.txt") as f:
+              diff = f.read()
+
+          if not diff.strip():
+              print("No changes to review.")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+                  s.write("## AI Code Review\n\nNo changes to review.\n")
+              exit(0)
+
+          prompt = (
+              "You are a senior code reviewer. Review the git diff below. "
+              "Report ONLY real issues — not style preferences. "
+              "Categories: CRITICAL (blocks merge), WARNING (should fix), INFO (consider). "
+              "Be concise. If no issues found, say 'No issues found.'\n\n"
+              "Check for:\n"
+              "1. Silent failures — undefined returns, swallowed errors, empty catch blocks\n"
+              "2. Cross-file consistency — exports match imports, shared constants in sync\n"
+              "3. Hardcoded secrets — API keys, tokens, passwords\n"
+              "4. Missing error handling — async without try-catch, unhandled promises\n"
+              "5. Logic errors — off-by-one, wrong comparisons, unreachable code\n"
+              "6. Security — injection risks, unsanitized input\n\n"
+              f"Diff:\n{diff}"
           )
 
-          REVIEW=$(echo "$RESPONSE" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('choices',[{}])[0].get('message',{}).get('content','Error: No response'))" 2>/dev/null || echo "Error parsing response")
+          payload = json.dumps({
+              "model": "gpt-5.3-codex",
+              "input": prompt,
+              "max_output_tokens": 4096
+          }).encode()
 
-          echo "## AI Code Review" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "$REVIEW" >> $GITHUB_STEP_SUMMARY
+          req = urllib.request.Request(
+              "https://api.openai.com/v1/responses",
+              data=payload,
+              headers={
+                  "Content-Type": "application/json",
+                  "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"
+              }
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=120) as resp:
+                  result = json.loads(resp.read())
+              review = result["output"][0]["content"][0]["text"]
+          except Exception as e:
+              review = f"Error calling OpenAI API: {e}"
+
+          print(review)
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write(f"## AI Code Review (Codex 5.3)\n\n{review}\n")
+
+          with open("/tmp/review.txt", "w") as f:
+              f.write(review)
+          PYEOF
 
       - name: Comment on PR
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
-            -d @- <<PAYLOAD
-          {
-            "model": "gpt-5.3-codex",
-            "temperature": 0.1,
-            "messages": [
-              {
-                "role": "system",
-                "content": "You are a senior code reviewer. Review the git diff. Report ONLY real issues. Be concise. Use markdown formatting."
-              },
-              {
-                "role": "user",
-                "content": "Review this diff:\n${{ steps.diff.outputs.diff }}"
-              }
-            ]
-          }
-          PAYLOAD
-          )
-
-          REVIEW=$(echo "$RESPONSE" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('choices',[{}])[0].get('message',{}).get('content','No issues found.'))")
-
-          gh pr comment ${{ github.event.pull_request.number }} --body "## 🤖 AI Code Review (Codex 5.3)
+          REVIEW=$(cat /tmp/review.txt)
+          gh pr comment ${{ github.event.pull_request.number }} --body "## AI Code Review (Codex 5.3)
 
           $REVIEW
 
